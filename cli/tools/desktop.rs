@@ -1483,6 +1483,8 @@ async fn run_desktop_hmr(
           laufey_backend.display()
         )
       })?;
+    #[cfg(windows)]
+    let _kill_on_exit = windows_kill_on_exit::KillOnExit::assign(&child);
     child
       .wait()
       .await
@@ -1496,6 +1498,71 @@ async fn run_desktop_hmr(
     bail!("LAUFEY backend exited with status: {}", status);
   }
   Ok(())
+}
+
+/// Ends the LAUFEY backend when `deno` exits, however it exits.
+///
+/// `kill_on_drop` only runs if the `Child` is dropped. Pressing Ctrl+C in a
+/// Windows console, or closing the console window, ends `deno` without
+/// running destructors, and the GUI-subsystem backend doesn't get the Ctrl+C
+/// itself, so it kept running and held the compiled app files open (#36500).
+/// A job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` makes Windows end the
+/// backend when the last handle to the job is closed, which happens when
+/// `deno` exits.
+#[cfg(windows)]
+mod windows_kill_on_exit {
+  use windows_sys::Win32::Foundation::CloseHandle;
+  use windows_sys::Win32::Foundation::HANDLE;
+  use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+  use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+  use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+  use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
+  use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+
+  /// Owns the job the backend was assigned to. Dropping it closes the job,
+  /// which ends the backend if it is still running.
+  pub struct KillOnExit(HANDLE);
+
+  impl KillOnExit {
+    /// Assigns `child` to a new kill-on-close job. Returns `None` if that
+    /// fails, e.g. when the child already exited; the backend then runs as
+    /// before, without the job.
+    pub fn assign(child: &tokio::process::Child) -> Option<Self> {
+      let process = child.raw_handle()?;
+      // SAFETY: the job handle is checked before use and closed exactly once,
+      // by `Drop` or below on failure. `info` is a zeroed POD struct whose
+      // size is passed along with it. `process` is a valid handle owned by
+      // `child`, which outlives this call.
+      unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+          return None;
+        }
+        let job = Self(job);
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags =
+          JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+          job.0,
+          JobObjectExtendedLimitInformation,
+          (&raw const info).cast(),
+          std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        (configured && AssignProcessToJobObject(job.0, process as HANDLE) != 0)
+          .then_some(job)
+      }
+    }
+  }
+
+  impl Drop for KillOnExit {
+    fn drop(&mut self) {
+      // SAFETY: `self.0` is a job handle owned by this value.
+      unsafe {
+        CloseHandle(self.0);
+      }
+    }
+  }
 }
 
 /// Marker file written into every generated desktop app directory/bundle so a
