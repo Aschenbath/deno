@@ -330,13 +330,17 @@ function getCallSites(
   frameCount = 10,
   options = undefined,
 ) {
+  if (options === undefined && typeof frameCount === "object") {
+    options = frameCount;
+    frameCount = 10;
+  }
   validateNumber(
     frameCount,
     "frameCount",
     0,
     kDefaultMaxCallStackSizeToCapture,
   );
-  if (options) {
+  if (options !== undefined) {
     validateObject(options, "options");
   }
   const target = {};
